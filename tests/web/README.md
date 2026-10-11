@@ -24,10 +24,11 @@ existing fallback. This is backend selection for testing, not a production patch
 Both environments have a bounded execution deadline and are closed after each run.
 
 The cases exercise incoming UTF-8 byte lengths, embedded NUL in values and keys,
-object reads/iteration, callback returns, caught JavaScript errors, and raw global
-assignment. Point the same runner at an affected build to verify it exits nonzero.
-The raw-global call includes the candidate ABI's extra length arguments; an older
-build ignores them and demonstrates the truncation. The public front API is unchanged.
+object reads/iteration, callback returns, caught JavaScript errors, and public
+global assignment through initialEnv, env.set, and env.global.set. Point the same
+runner at an affected build to verify it exits nonzero. The legacy pushGlobalToLua
+export keeps upstream's null-terminated key contract and is not a binary-key test.
+The public front API is unchanged.
 
 The lifetime suite runs in one loaded runtime (not a fresh worker per VM):
 
@@ -39,7 +40,8 @@ npm test -- --backend Asyncify --build-dir ../../build-web --suite lifetime
 It covers 100 recreation cycles, a second live VM during repeated close/recreate,
 closed wrappers, coroutine-owned exports, clone/release/reference reuse, error
 recovery and callback identity under allocation/GC pressure. All owned states are
-closed. Those counts are not a claim of zero heap leaks. Same-state calls are
+closed. Released-value cloning and destroyed-state clone/release must reject
+before entering native code. Those counts are not a claim of zero heap leaks. Same-state calls are
 serialized; destroying an actively executing VM remains unsupported.
 
 Use `--case release-reuse --suite lifetime` to isolate one lifetime regression

@@ -60,12 +60,24 @@ export async function runTests(data) {
             const [table] = await call('iterate', new Map([['a\0b', 'v\0tail']]));
             equal(table.keys(), ['a\0b']); equal(table.get('a\0b'), 'v\0tail');
         });
-        await check('raw-global', async () => {
-            const key = 'global\0key', value = 'v\0tail', bytes = s => new TextEncoder().encode(s).length;
-            M.ccall('pushGlobalToLua', 'void', ['number','string','string','string','number','number'],
-                [vm.state, key, 'string', value, bytes(key), bytes(value)]);
-            equal(vm.env.global.get(key), value);
-            equal(vm.env.global.keys().filter(k => k.startsWith('global')), [key]);
+        await check('public-globals', async () => {
+            const entries = [['host', 'prefix'], ['host\0key', 'v\0tail']];
+            const initial = await LuauState.createAsync(Object.fromEntries(entries));
+            try {
+                const [read] = await initial.loadstring('return function(k) return getfenv()[k] end', '@initial-globals.luau', true)();
+                for (const [key, value] of entries) {
+                    equal(initial.env.get(key), value);
+                    equal(await read(key), [value]);
+                }
+            } finally { initial.destroy(); }
+            const [read] = await vm.loadstring('return function(k) return getfenv()[k] end', '@runtime-globals.luau', true)();
+            for (const target of [vm.env, vm.env.global]) {
+                for (const [key, value] of entries) target.set(key, value, true);
+                for (const [key, value] of entries) {
+                    equal(target.get(key), value);
+                    equal(await read(key), [value]);
+                }
+            }
         });
         await check('opaque-identifiers', async () => {
             equal(await call('match', 'scope\0new', 'scope\0old'), [false]);
@@ -83,4 +95,3 @@ export async function runTests(data) {
 if (typeof WorkerGlobalScope !== 'undefined') {
     self.onmessage = async ({data}) => postMessage(await runTests(data));
 }
-

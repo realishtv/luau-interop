@@ -29,6 +29,8 @@ typedef struct
     const char* ref;
 } jsref_ud;
 
+int jsfunc_wrapper(lua_State* L);
+
 void fprint(const char* fmt, ...)
 {
     va_list args;
@@ -73,68 +75,70 @@ void fprintwarn(const char* fmt, ...)
     va_end(args);
 }
 
-// A registry reference belongs to one VM, even when allocation addresses are reused.
-struct InteropState
+struct JsState
 {
     int envId = -1;
     int globalsRef = LUA_NOREF;
-    int sandboxedGlobalsRef = LUA_NOREF;
-    std::unordered_map<const void*, int> refCache;
+    int fakeGlobalsRef = LUA_NOREF;
+
+    std::unordered_map<const void*, int> refs;
 };
 
-static std::unordered_map<lua_State*, InteropState> interopStates;
-
-static InteropState& getInteropState(lua_State* L)
+static JsState* jsState(lua_State* L)
 {
-    return interopStates.at(lua_mainthread(L));
+    return static_cast<JsState*>(lua_callbacks(L)->userdata);
 }
 
 int getPersistentRef(lua_State* L, int index)
 {
-    auto& cache = getInteropState(L).refCache;
+    JsState* js = jsState(L);
+
     const void* ptr = lua_topointer(L, index);
-    auto it = cache.find(ptr);
-    if (it != cache.end())
+    if (!ptr) {
+        return lua_ref(L, index);
+    }
+
+    auto it = js->refs.find(ptr);
+    if (it != js->refs.end())
+    {
         return it->second;
+    }
 
     int ref = lua_ref(L, index);
-    cache[ptr] = ref;
+    js->refs[ptr] = ref;
     return ref;
 }
 
 void setEnvId(lua_State* L, int envId)
 {
-    getInteropState(L).envId = envId;
+    jsState(L)->envId = envId;
 }
 
 int getEnvId(lua_State* L)
 {
-    auto it = interopStates.find(lua_mainthread(L));
-    return it != interopStates.end() ? it->second.envId : -1;
+    JsState* js = jsState(L);
+    return js ? js->envId : -1;
 }
 
-static int saveGlobalsRef(lua_State* L, int& ref)
+static int saveGlobalsRef(lua_State* L, int& slot)
 {
-    if (ref == LUA_NOREF)
-    {
-        lua_pushvalue(L, LUA_GLOBALSINDEX);
-        ref = lua_ref(L, -1);
-        lua_pop(L, 1);
-    }
-    return ref;
+    if (slot != LUA_NOREF)
+        return slot;
+
+    lua_pushvalue(L, LUA_GLOBALSINDEX);
+    slot = lua_ref(L, -1);
+    lua_pop(L, 1);
+    return slot;
 }
 
 int saveOriginalGlobalsRef(lua_State* L)
 {
-    return saveGlobalsRef(L, getInteropState(L).globalsRef);
+    return saveGlobalsRef(L, jsState(L)->globalsRef);
 }
-
 int saveSandboxedGlobalsRef(lua_State* L)
 {
-    return saveGlobalsRef(L, getInteropState(L).sandboxedGlobalsRef);
+    return saveGlobalsRef(L, jsState(L)->fakeGlobalsRef);
 }
-
-int jsfunc_wrapper(lua_State* L);
 
 static void getJsWrapperCache(lua_State* L)
 {
@@ -483,12 +487,15 @@ EM_JS(void, ensureInterop, (), {
                     {
                         return;
                     }
+
                     if (!Module.states[this.stateIdx]) {
                         throw new Module.GlueError("cannot release a value from a destroyed state");
                     }
+
                     Module.ccall('luaUnref', 'void', [ 'number', 'number' ], [ this.state, this.ref ]);
-                    Module.states[this.stateIdx].luaValueCache.delete(this.ref);
                     this.released = true;
+
+                    Module.states[stateIdx]?.luaValueCache.delete(ref);
                 }
             },
             toString() {
@@ -764,7 +771,7 @@ EM_JS(void, ensureInterop, (), {
 
         const [type, value] = Module.jsToLuauValue(stateIdx, null, key);
 
-        const transactionIdx = Module.ccall("luaIndex", "number", [ "number", "number", "string", "string", "number" ], [ luaTableData.state, luaTableData.ref, type, value, lengthBytesUTF8(value) ]);
+        const transactionIdx = Module.ccall("luaIndex", "number", [ "number", "number", "string", "string" ], [ luaTableData.state, luaTableData.ref, type, value ]);
 
         const transactionData = Module.states[stateIdx].transactionData[transactionIdx];
         delete Module.states[stateIdx].transactionData[transactionIdx];
@@ -789,7 +796,7 @@ EM_JS(void, ensureInterop, (), {
         const [KT, KV] = Module.jsToLuauValue(stateIdx, null, key);
         const [VT, VV] = Module.jsToLuauValue(stateIdx, null, value);
 
-        const modified = Module.ccall("luaNewIndex", "number", [ "number", "number", "string", "string", "string", "string", "boolean", "number", "number" ], [ luaTableData.state, luaTableData.ref, KT, KV, VT, VV, bypassReadonly, lengthBytesUTF8(KV), lengthBytesUTF8(VV) ]);
+        const modified = Module.ccall("luaNewIndex", "number", [ "number", "number", "string", "string", "string", "string", "boolean" ], [ luaTableData.state, luaTableData.ref, KT, KV, VT, VV, bypassReadonly ]);
 
         if (!bypassReadonly && !modified && !Module.options.get("LUA_NONSTRICT_READONLY")) {
             throw new LuaError("attempt to modify a readonly table");
@@ -872,7 +879,7 @@ EM_JS(void, ensureInterop, (), {
         {
         //--> value types
         case "string":
-            return String(v.value).replaceAll("\\u0000", "\0");
+            return String(v.value);
         case "number":
             if (v.value == "inf") {
                 return Infinity
@@ -939,11 +946,13 @@ EM_JS(void, ensureInterop, (), {
         return false;
     };
 
-    Module.jsToLuauValue = function(stateIdx, parent, key) {
+    Module.jsToLuauValue = function(stateIdx, parent, key, preread) {
         let type = "unknown";
         let value = null;
-        
-        if (parent != null) {
+
+        if (preread) {
+            value = preread.value ?? null;
+        } else if (parent != null) {
             if (parent instanceof Map) {
                 value = parent.get(key) ?? null;
             } else {
@@ -954,10 +963,10 @@ EM_JS(void, ensureInterop, (), {
         }
 
         if (Module.securityTransmitList.has(value)) {
-            Module.fprintwarn(`illegal j2l conversion: js value '${key ? Module.keyName(key) : "unknown"}' is blocked`);
+            Module.fprintwarn(`illegal j2l conversion: js value at key '${key != null ? Module.keyName(key) : "unknown"}' is blocked`);
             return ["nil", "nil"];
         }
-        
+
         if (value === null || value === undefined) {
             type = "nil";
             value = "nil";
@@ -977,8 +986,12 @@ EM_JS(void, ensureInterop, (), {
             value = wrapped.toString();
         }
         else if (typeof value == "string") {
-            type = "string";
-            value = String(value);
+            if (value.includes("\0")) {
+                type = "lstring";
+                value = lengthBytesUTF8(value) + ":" + value;
+            } else {
+                type = "string";
+            }
         }
         else if (typeof value == "boolean")
         {
@@ -1076,7 +1089,9 @@ EM_JS(void, ensureInterop, (), {
     };
 
     Module.luaError = function(L_ptr, s) {
-        Module.ccall('pushValueToLuaWrapper', 'void', [ 'number', 'string', 'string', 'string', 'number' ], [ L_ptr, 'string', s, `<jserror>`, lengthBytesUTF8(s) ]);
+        const type = s.includes("\0") ? 'lstring' : 'string';
+        const value = type === 'lstring' ? lengthBytesUTF8(s) + ':' + s : s;
+        Module.ccall('pushValueToLuaWrapper', 'void', [ 'number', 'string', 'string', 'string' ], [ L_ptr, type, value, `<jserror>` ]);
         return -1;
     }
 });
@@ -1110,14 +1125,14 @@ EM_JS(int, getJSProperty, (int L_ptr, int envId, const char* jsRefIdStr, const c
     const rawVal = data[Module.JS_VALUE].value;
     if (rawVal instanceof Map) {
         if (!rawVal.has(keyData)) {
-            Module.ccall('pushValueToLuaWrapper', 'void', ['number', 'string', 'string', 'string', 'number' ], [L_ptr, 'nil', 'nil', Module.keyName(keyData), lengthBytesUTF8('nil') ]);
+            Module.ccall('pushValueToLuaWrapper', 'void', ['number', 'string', 'string', 'string'], [L_ptr, 'nil', 'nil', Module.keyName(keyData)]);
             return 1;
         }
     }
 
     const [type, value] = Module.jsToLuauValue(envId, data[Module.JS_VALUE].value, keyData);
 
-    Module.ccall('pushValueToLuaWrapper', 'void', [ 'number', 'string', 'string', 'string', 'number' ], [ L_ptr, type, value, Module.keyName(keyData), lengthBytesUTF8(value) ]);
+    Module.ccall('pushValueToLuaWrapper', 'void', [ 'number', 'string', 'string', 'string' ], [ L_ptr, type, value, Module.keyName(keyData) ]);
     return 1;
 
     return 0;
@@ -1195,10 +1210,15 @@ EM_JS(char*, prepareJSKeyList, (int L_ptr, int envId, const char* jsRefIdStr), {
                 k !== Module.LUA_VALUE && k !== Module.JS_VALUE && k !== Module.JS_MUTABLE
             );
         } else if (typeof data[Module.JS_VALUE].value === 'object') {
-            keys = Object.keys(data[Module.JS_VALUE].value);
+            const value = data[Module.JS_VALUE].value;
+            keys = Array.isArray(value)
+                ? Array.from(value.keys()).filter(i => i in value)
+                : Object.keys(value);
         }
 
         if (keys) {
+            keys = keys.filter(k => !Module.securityTransmitList.has(k));
+
             const keysId = String(jsRefId) + "_keys_" + crypto.randomUUID();
             
             Module.states[envId].jsValueCache.set(keysId, {
@@ -1260,22 +1280,44 @@ EM_JS(int, getJSIteratorNext, (int L_ptr, int envId, const char* jsRefIdStr, con
 
     if (objData && keysData) {
         const keys = keysData[Module.JS_VALUE].value;
-        if (index >= keys.length) {
-            Module.states[envId].jsValueCache.delete(keysRefId);
-            return 0; 
+        const parent = objData[Module.JS_VALUE].value;
+
+        let skipped = 0;
+        let currentKey;
+        let read;
+        while (true) {
+            if (index + skipped >= keys.length) {
+                Module.states[envId].jsValueCache.delete(keysRefId);
+                return 0;
+            }
+
+            currentKey = keys[index + skipped];
+            read = { value: parent instanceof Map ? parent.get(currentKey) : parent[currentKey] };
+
+            if (!Module.securityTransmitList.has(read.value)) {
+                break;
+            }
+            skipped++;
         }
 
-        const currentKey = keys[index];
+        if (currentKey == null) {
+            return Module.luaError(L_ptr, "table index is nil");
+        }
 
-        Module.ccall('pushValueToLuaWrapper', 'void', ['number', 'string', 'string', 'string', 'number' ], [L_ptr, 'string', Module.keyName(currentKey), "jsiter__key", lengthBytesUTF8(Module.keyName(currentKey)) ]);
-
-        const [type, value] = Module.jsToLuauValue(envId, objData[Module.JS_VALUE].value, currentKey);
+        const [keyType, keyValue] = Module.jsToLuauValue(envId, null, currentKey);
+        if (keyType === "nil") {
+            return Module.luaError(L_ptr, "illegal table key: unsupported type '" + typeof currentKey + "'");
+        }
         
+        Module.ccall('pushValueToLuaWrapper', 'void', ['number', 'string', 'string', 'string'], [L_ptr, keyType, keyValue, "jsiter__key"]);
+
+        const [type, value] = Module.jsToLuauValue(envId, parent, currentKey, read);
+
         const valueStr = String(value);
 
-        Module.ccall('pushValueToLuaWrapper', 'void', ['number', 'string', 'string', 'string', 'number' ], [L_ptr, type, valueStr, "jsiter__value", lengthBytesUTF8(valueStr) ]);
+        Module.ccall('pushValueToLuaWrapper', 'void', ['number', 'string', 'string', 'string'], [L_ptr, type, valueStr, "jsiter__value"]);
 
-        return 1;
+        return skipped + 1;
     }
 
     return 0;
@@ -1433,20 +1475,17 @@ std::string serializeLuaValue(lua_State* L, int index, int* refOut)
     case LUA_TBUFFER:
     case LUA_TVECTOR:
     {
-        // Inspect the live closure rather than caching its allocation address: the
-        // weak wrapper cache allows collection and address reuse within a VM too.
-        if (valueType == LUA_TFUNCTION && lua_iscfunction(L, index) && lua_tocfunction(L, index) == jsfunc_wrapper)
+        // note(xNasuni): it is possible for a "lua_tfunction" to have a js function closure but still be a "lua_tfunction"
+        if (valueType == LUA_TFUNCTION)
         {
-            if (lua_getupvalue(L, index, 1))
+            if (lua_tocfunction(L, index) == jsfunc_wrapper && lua_getupvalue(L, index, 1))
             {
-                jsref_ud* ud = static_cast<jsref_ud*>(lua_touserdatatagged(L, -1, UTAG_JSFUNC));
+                jsref_ud* ud = (jsref_ud*)lua_touserdatatagged(L, -1, UTAG_JSFUNC);
+                lua_pop(L, 1);
                 if (ud)
                 {
-                    std::string result = std::string("{\"type\":\"jfunction\",\"value\":") + ud->ref + "}";
-                    lua_pop(L, 1);
-                    return result;
+                    return std::string("{\"type\":\"jfunction\",\"value\":") + ud->ref + "}";
                 }
-                lua_pop(L, 1);
             }
         }
 
@@ -1652,9 +1691,15 @@ int proxy_iter_next(lua_State* L)
 
     int found = getJSIteratorNext((int)L, envId, jsRefIdStr, keysRefIdStr, index);
 
+    if (found < 0)
+    {
+        lua_error(L);
+        return 0;
+    }
+
     if (found)
     {
-        lua_pushinteger(L, index + 1);
+        lua_pushinteger(L, index + found);
         lua_replace(L, lua_upvalueindex(3));
 
         return 2;
@@ -1814,7 +1859,7 @@ EM_JS(int, pushRetData, (int L_ptr, int envId, int returnDataKey), {
 
     returnData.forEach((data) => {
         const [type, value] = Module.jsToLuauValue(envId, null, data);
-        Module.ccall('pushValueToLuaWrapper', 'void', [ 'number', 'string', 'string', 'string', 'number' ], [ L_ptr, type, value, `${value}`, lengthBytesUTF8(value) ]);
+        Module.ccall('pushValueToLuaWrapper', 'void', [ 'number', 'string', 'string', 'string' ], [ L_ptr, type, value, `${value}` ]);
     });
 
     return returnData.length;
@@ -1886,7 +1931,7 @@ int jsfunc_wrapper(lua_State* L)
     return proxy_call(L);
 }
 
-void pushValueToLua(lua_State* L, const char* type, const char* value, size_t valueLength, const char* key = nullptr)
+void pushValueToLua(lua_State* L, const char* type, const char* value, const char* key = nullptr)
 {
     if (strcmp(type, "number") == 0)
     {
@@ -1899,7 +1944,19 @@ void pushValueToLua(lua_State* L, const char* type, const char* value, size_t va
     }
     else if (strcmp(type, "string") == 0)
     {
-        lua_pushlstring(L, value, valueLength);
+        lua_pushstring(L, value);
+    }
+    else if (strcmp(type, "lstring") == 0)
+    {
+        char* end = nullptr;
+        size_t len = strtoull(value, &end, 10);
+        if (end == value || *end != ':')
+        {
+            fprintwarn("illegal push: malformed lstring for key '%s'", key ? key : "unknown");
+            lua_pushnil(L);
+            return;
+        }
+        lua_pushlstring(L, end + 1, len);
     }
     else if (strcmp(type, "boolean") == 0)
     {
@@ -1964,7 +2021,7 @@ void pushValueToLua(lua_State* L, const char* type, const char* value, size_t va
     }
 }
 
-extern "C" void pushGlobalToLua(lua_State* L, const char* key, const char* type, const char* value, size_t keyLength, size_t valueLength)
+extern "C" void pushGlobalToLua(lua_State* L, const char* key, const char* type, const char* value)
 {
     if (!L || !key || !type || !value)
     {
@@ -1972,14 +2029,13 @@ extern "C" void pushGlobalToLua(lua_State* L, const char* key, const char* type,
         return;
     }
 
-    lua_pushlstring(L, key, keyLength);
-    pushValueToLua(L, type, value, valueLength, key);
-    lua_settable(L, LUA_GLOBALSINDEX);
+    pushValueToLua(L, type, value, key);
+    lua_setglobal(L, key);
 }
 
-extern "C" void pushValueToLuaWrapper(lua_State* L, const char* type, const char* value, const char* key, size_t valueLength)
+extern "C" void pushValueToLuaWrapper(lua_State* L, const char* type, const char* value, const char* key)
 {
-    pushValueToLua(L, type, value, valueLength, key);
+    pushValueToLua(L, type, value, key);
 }
 
 // clang-format off
@@ -1994,7 +2050,7 @@ EM_JS(int, pushArgs, (int L_int, int envId, int argIdx), {
 
     argData.forEach((data) => {
         const [type, value] = Module.jsToLuauValue(envId, null, data);
-        Module.ccall("pushValueToLuaWrapper", 'void', [ 'number', 'string', 'string', 'string', 'number' ], [ L_int, type, value, '<callarg>', lengthBytesUTF8(value) ]);
+        Module.ccall("pushValueToLuaWrapper", 'void', [ 'number', 'string', 'string', 'string' ], [ L_int, type, value, '<callarg>' ]);
     });
     
     return length;
@@ -2171,12 +2227,11 @@ extern "C" void luaUnref(lua_State* L, int ref)
     const void* ptr = lua_topointer(L, -1);
     lua_pop(L, 1);
 
-    if (ptr)
+    JsState* js = jsState(L);
+    auto it = ptr ? js->refs.find(ptr) : js->refs.end();
+    if (it != js->refs.end() && it->second == ref)
     {
-        auto& cache = getInteropState(L).refCache;
-        auto it = cache.find(ptr);
-        if (it != cache.end() && it->second == ref)
-            cache.erase(it);
+        js->refs.erase(it);
     }
 
     lua_unref(L, ref);
@@ -2193,7 +2248,7 @@ EM_JS(int, sendValueToJS, (int envId, const char* valueJson), {
 });
 // clang-format on
 
-extern "C" int luaIndex(lua_State* L, int lref, const char* KT, const char* KV, size_t keyLength)
+extern "C" int luaIndex(lua_State* L, int lref, const char* KT, const char* KV)
 {
     int envId = getEnvId(L);
     if (envId == -1)
@@ -2203,7 +2258,7 @@ extern "C" int luaIndex(lua_State* L, int lref, const char* KT, const char* KV, 
     }
 
     lua_getref(L, lref);
-    pushValueToLua(L, KT, KV, keyLength, "<indexarg>");
+    pushValueToLua(L, KT, KV, "<indexarg>");
 
     lua_rawget(L, -2);
 
@@ -2214,7 +2269,7 @@ extern "C" int luaIndex(lua_State* L, int lref, const char* KT, const char* KV, 
     return sendValueToJS(envId, valueJson.c_str());
 }
 
-extern "C" bool luaNewIndex(lua_State* L, int lref, const char* KT, const char* KV, const char* VT, const char* VV, bool bypassReadonly, size_t keyLength, size_t valueLength)
+extern "C" bool luaNewIndex(lua_State* L, int lref, const char* KT, const char* KV, const char* VT, const char* VV, bool bypassReadonly)
 {
     lua_getref(L, lref);
 
@@ -2232,8 +2287,8 @@ extern "C" bool luaNewIndex(lua_State* L, int lref, const char* KT, const char* 
         }
     }
 
-    pushValueToLua(L, KT, KV, keyLength, "<indexarg>");
-    pushValueToLua(L, VT, VV, valueLength, KV);
+    pushValueToLua(L, KT, KV, "<indexarg>");
+    pushValueToLua(L, VT, VV, KV);
 
     lua_rawset(L, -3);
 
@@ -2361,7 +2416,7 @@ extern "C" lua_State* makeLuaState(int envId)
 
     // create new state
     lua_State* L = luaL_newstate();
-    interopStates.emplace(L, InteropState{});
+    lua_callbacks(L)->userdata = new JsState();
 
     // setup state
     setupState(L);
@@ -2457,9 +2512,9 @@ extern "C" int luauLoad(lua_State* L, int sourceIdx, int chunkNameIdx)
 
 extern "C" void luauClose(lua_State* L)
 {
-    lua_State* owner = lua_mainthread(L);
+    delete jsState(L);
+    lua_callbacks(L)->userdata = nullptr;
     lua_close(L);
-    interopStates.erase(owner);
 }
 
 extern "C" bool isreadonly(lua_State* L, int lref)

@@ -40,15 +40,29 @@ export async function lifetimeTests({LuauState, M, check, equal}) {
         });
         await check('release-reuse', async () => {
             const vm = await create();
+            const rejectsBeforeNative = async operation => {
+                const ccall = M.ccall;
+                let nativeCalls = 0;
+                M.ccall = function(name, ...args) {
+                    if (name === 'luaCloneref' || name === 'luaUnref') {
+                        nativeCalls++;
+                        throw Error('unexpected native reference access');
+                    }
+                    return ccall.call(this, name, ...args);
+                };
+                try { await rejects(operation); equal(nativeCalls, 0); }
+                finally { M.ccall = ccall; }
+            };
             const [get] = await execute(vm, 'local t={answer=42} return function() return t end');
             const [original] = await get(); const clone = original[M.LUA_VALUE].persistentRef();
             clone[M.LUA_VALUE].release(); equal((await get())[0] === original, true);
             original[M.LUA_VALUE].release(); await rejects(() => original.get('answer'));
+            await rejectsBeforeNative(() => original[M.LUA_VALUE].persistentRef());
             const [fresh] = await get(); equal(fresh === original, false); equal(fresh.get('answer'), 42);
             for (let i=0;i<100;i++) { const clone=fresh[M.LUA_VALUE].persistentRef(); equal(clone.get('answer'),42); clone[M.LUA_VALUE].release(); }
             close(vm);
-            await rejects(() => fresh[M.LUA_VALUE].persistentRef());
-            await rejects(() => fresh[M.LUA_VALUE].release());
+            await rejectsBeforeNative(() => fresh[M.LUA_VALUE].persistentRef());
+            await rejectsBeforeNative(() => fresh[M.LUA_VALUE].release());
         });
         await check('error-recovery', async () => {
             for (const source of ['local =', 'error("sentinel")']) {

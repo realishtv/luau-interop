@@ -57,7 +57,7 @@ try {
         const timer = setTimeout(() => reject(Error('browser deadline (65000ms)')), 65000);
         timer.unref();
     })]);
-    report.expectedCases = values.suite === 'lifetime' ? ['recreate-100', 'two-live-vms', 'closed-wrapper', 'coroutine-owner', 'release-reuse', 'error-recovery', 'callback-gc'] : [...Array.from({length: 9}, (_, i) => `value-${i}`), 'distinct-table-keys', 'object-keys-and-iteration', 'raw-global', 'opaque-identifiers', 'js-error-ingress'];
+    report.expectedCases = values.suite === 'lifetime' ? ['recreate-100', 'two-live-vms', 'closed-wrapper', 'coroutine-owner', 'release-reuse', 'error-recovery', 'callback-gc'] : [...Array.from({length: 9}, (_, i) => `value-${i}`), 'distinct-table-keys', 'object-keys-and-iteration', 'public-globals', 'opaque-identifiers', 'js-error-ingress'];
     if (values.case) report.expectedCases = report.expectedCases.filter(id => id === values.case);
     if (!report.expectedCases.length || JSON.stringify(report.results.map(r => r.id)) !== JSON.stringify(report.expectedCases) || report.results.some(result => !result.pass)) process.exitCode = 1;
 } catch (error) { report.error = error.stack; process.exitCode = 1; }
